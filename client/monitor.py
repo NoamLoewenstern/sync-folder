@@ -8,6 +8,7 @@ from watchdog.events import FileSystemEventHandler
 from collections import deque
 import requests
 from utils import debounce
+from contextlib import ExitStack
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,33 @@ def group_by_chunks_of_max_size(
             files[-1].append(filepath)
             sum_size += filepath_size
     return files
+
+
+def upload_files(filepaths: list[str], upload_url: str):
+    with ExitStack() as stack:
+        files = [
+            ("files", stack.enter_context(open(filepath, "rb")))
+            for filepath in filepaths
+        ]
+        try:
+            resp = requests.post(
+                upload_url,
+                files=files,
+                verify=False,
+                timeout=DEFAULT_TIMEOUT,
+            )
+            resp.raise_for_status()
+            logger.info(f"Uploaded {len(filepaths)} files")
+        except Exception as e:
+            logger.exception(f"Failed to upload: {filepaths} {str(e)}")
+            raise
+
+
+def secure_upload_files(filepaths: list[str], upload_url: str):
+    filepaths = filter_out_max_size(filepaths)
+    chunks_of_filepaths = group_by_chunks_of_max_size(filepaths)
+    for filepaths in chunks_of_filepaths:
+        upload_files(filepaths, upload_url)
 
 
 def EventHandlerWithDebounce(debounce_ms: int):
@@ -87,27 +115,13 @@ def EventHandlerWithDebounce(debounce_ms: int):
             filepaths = filter_out_max_size(filepaths)
             chunks_of_filepaths = group_by_chunks_of_max_size(filepaths)
 
-            files = []
             try:
                 for filepaths in chunks_of_filepaths:
-                    files = [("files", open(filepath, "rb")) for filepath in filepaths]
-                    resp = requests.post(
-                        self.upload_url,
-                        files=files,
-                        verify=False,
-                        timeout=DEFAULT_TIMEOUT,
-                    )
-                    resp.raise_for_status()
-                # clear queue from files that were uploaded
+                    upload_files(filepaths, self.upload_url)
                 for filepath in filepaths:
                     self.upload_queue.remove(filepath)
-                print(f"Uploaded {len(filepaths)} files")
             except Exception as e:
                 self.logger.exception(f"Failed to upload: {filepaths} {str(e)}")
-            finally:
-                # close file handlers
-                for file in files:
-                    file[1].close()
 
         def upload_files(self, filepaths: list[str] | str):
             filepaths = [filepaths] if isinstance(filepaths, str) else filepaths
@@ -150,6 +164,11 @@ def get_args():
         default=3000,
         help="ms to wait before uploading",
     )
+    parser.add_argument(
+        "--init-upload",
+        action="store_true",
+        help="upload all files on first start",
+    )
     args = parser.parse_args()
     return args
 
@@ -164,6 +183,7 @@ if __name__ == "__main__":
     if not args.directory.exists():
         logging.error(f"directory {args.directory!r} does not exist")
         sys.exit(1)
+
     logging.info(f"start watching directory {args.directory!r}")
     event_handler = EventHandlerWithDebounce(args.debounce)(
         upload_url=args.url, logger=logger
@@ -171,6 +191,10 @@ if __name__ == "__main__":
     observer = Observer()
     observer.schedule(event_handler, args.directory, recursive=True)  # type: ignore
     observer.start()
+
+    if args.init_upload:
+        secure_upload_files(list(args.directory.glob("*")), args.url)
+
     try:
         while True:
             time.sleep(1)
