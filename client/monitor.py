@@ -11,6 +11,39 @@ from utils import debounce
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_TIMEOUT = 60
+BATCH_MAX_SIZE_IN_BYTES = 30 * 1024 * 1024  # 30MB
+
+
+def filter_out_max_size(
+    filepaths: list[str], max_size_in_bytes: int = BATCH_MAX_SIZE_IN_BYTES
+) -> list[str]:
+    """Returns a list of filepaths that are less than max_size_in_bytes"""
+    files: list[str] = []
+    for filepath in filepaths:
+        if Path(filepath).stat().st_size > max_size_in_bytes:
+            logger.error(f"file {filepath!r} is too large to upload")
+            continue
+        files.append(filepath)
+    return files
+
+
+def group_by_chunks_of_max_size(
+    filepaths: list[str], max_sum_size: int = BATCH_MAX_SIZE_IN_BYTES
+) -> list[list[str]]:
+    """Returns a list of filepaths that are less than max_sum_size"""
+    files: list[list[str]] = [[]]
+    sum_size = 0
+    for filepath in filepaths:
+        filepath_size = Path(filepath).stat().st_size
+        if sum_size + filepath_size > max_sum_size:
+            files.append([filepath])
+            sum_size = filepath_size
+        else:
+            files[-1].append(filepath)
+            sum_size += filepath_size
+    return files
+
 
 def EventHandlerWithDebounce(debounce_ms: int):
     class UploadFileEventHandler(FileSystemEventHandler):
@@ -51,13 +84,24 @@ def EventHandlerWithDebounce(debounce_ms: int):
         def debounced_upload_from_queue(self):
             filepaths = list(self.upload_queue)
             print(f"Uploading {len(filepaths)} files")
-            self.upload_queue.clear()
+            filepaths = filter_out_max_size(filepaths)
+            chunks_of_filepaths = group_by_chunks_of_max_size(filepaths)
 
             files = []
             try:
-                files = [("files", open(filepath, "rb")) for filepath in filepaths]
-                resp = requests.post(self.upload_url, files=files, verify=False)
-                resp.raise_for_status()
+                for filepaths in chunks_of_filepaths:
+                    files = [("files", open(filepath, "rb")) for filepath in filepaths]
+                    resp = requests.post(
+                        self.upload_url,
+                        files=files,
+                        verify=False,
+                        timeout=DEFAULT_TIMEOUT,
+                    )
+                    resp.raise_for_status()
+                # clear queue from files that were uploaded
+                for filepath in filepaths:
+                    self.upload_queue.remove(filepath)
+                print(f"Uploaded {len(filepaths)} files")
             except Exception as e:
                 self.logger.exception(f"Failed to upload: {filepaths} {str(e)}")
             finally:
@@ -76,6 +120,9 @@ def EventHandlerWithDebounce(debounce_ms: int):
                     continue
                 # already in queue
                 if path in self.upload_queue:
+                    continue
+                if Path(path).stat().st_size > BATCH_MAX_SIZE_IN_BYTES:
+                    self.logger.error(f"file {path!r} is too large to upload")
                     continue
                 self.upload_queue.append(str(path))
             self.debounced_upload_from_queue()
